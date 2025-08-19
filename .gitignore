@@ -26,3 +26,5 @@ Thumbs.db
 
 # Google Apps Script
 .clasp.json
+# SpecStory explanation file
+.specstory/.what-is-this.md

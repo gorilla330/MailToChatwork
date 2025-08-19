@@ -6,14 +6,19 @@
  */
 const CONFIG = {
   INFO_ADDRESS: 'info@ascope.net',
-  // 件名条件：完全一致(お問い合わせがありました) or 含有一致(＜至急＞<B肝新規相談会申込>)
-  SUBJECT_HOOK: /^(お問い合わせがありました)$|＜至急＞<B肝新規相談会申込>/,
-  SUBJECT_QUERIES: ['お問い合わせがありました', '＜至急＞<B肝新規相談会申込>'], // Gmail検索（OR）
+  // 「Fwd:」や「【…】問合せフォームからのお問い合わせがありました」に対応
+  SUBJECT_HOOK: /お問い合わせがありました|(?:お問い合わせ|お問合せ|お問合わせ|お問い合せ|問合せ|問い合わせ)フォームからのお問い合わせがありました|＜至急＞<B肝新規相談会申込>/,
+  SUBJECT_QUERIES: [
+    'お問い合わせがありました',
+    '＜至急＞<B肝新規相談会申込>',
+    'RAW:(お問い合わせ 回答 ありました)',
+    'RAW:(問合せ フォーム お問い合わせ ありました)'
+  ], // Gmail検索（OR）
   URGENT_KEYWORD: '至急',                        // 至急判定キーワード（件名/本文）
   DONE_LABEL: 'CWタスク化済',                 // Gmailの重複防止ラベル
   // 投稿先（テスト/本番）
   MODE: 'prod',                               // 'test' | 'prod'
-  TEST_ROOM_ID: '5564141',                    // マイチャット
+  TEST_ROOM_ID: '406362955',                  // ASCOPEのbotくんのマイチャット
   PROD_ROOM_ID: '18848369',                   // 全体スレ
   TO_IDS_CSV: '<<11111,22222>>',             // 例: "11111,22222"。通知では未使用（必要なら本文先頭に宛先文言を追加可）
   TOKEN_PROP_KEY: 'CHATWORK_TOKEN',
@@ -23,6 +28,7 @@ const CONFIG = {
   DUE: { enable: true, daysFromNow: 2, hour: 18, minute: 0, tz: 'Asia/Tokyo' },
   // 検索期間（日）: 時間主導トリガーによるポーリング用。短いほど高速。
   SEARCH_DAYS: 2,
+
   // カテゴリ→投稿先ルームID（本番）
   ROOM_MAP: {
     general: '33559798',     // 一般案件管理スレ（トップページ含む）
@@ -44,10 +50,44 @@ const CONFIG = {
   SPREADSHEET_ID: '1cb6AGC7YOZNeu0orwYC-3N38_bzgSneEQ_nmL-p8Tqs',
   SHEET_LOG: 'log',          // データログ
   SHEET_SUMMARY: 'summary',  // 集計
+
+  // ===== 本文フィルタ（通知スキップ） =====
+  // 例：トップページ経由で「■件名：『その他』のお問い合わせ（簡単な内容）」が含まれる営業メールは通知しない
+  BODY_SKIP_PATTERNS: [
+    '「その他」のお問い合わせ（簡単な内容）'
+  ],
+  // true: 件名に「トップページ」を含む（=カテゴリがトップページ）メールに限定して本文フィルタを適用
+  BODY_SKIP_ONLY_FOR_TOP: true,
+  // true: スキップしても重複防止ラベルを付けて再処理回避
+  SKIP_ADD_DONE_LABEL: true,
+  // デバッグログ出力制御（false で無出力）
+  DEBUG: true,
 };
+
+/** 共通ログ関数：Logger.log と console.log の両方に出力 */
+function debugLog(...args) {
+  if (!CONFIG.DEBUG) return; // ← DEBUG=false なら無出力
+  try { Logger.log(args.map(x => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ')); } catch(_) {}
+  try { console.log(...args); } catch(_) {}
+}
+
+/** スレッド＆全メッセージに DONE ラベル付与（保険付き） */
+function applyDoneLabel_(thread) {
+  const doneLabel = GmailApp.getUserLabelByName(CONFIG.DONE_LABEL) || GmailApp.createLabel(CONFIG.DONE_LABEL);
+  try { thread.addLabel(doneLabel); } catch (e) { debugLog('[WARN] thread.addLabel failed', e); }
+  try {
+    const msgs = thread.getMessages();
+    for (const m of msgs) {
+      try { m.addLabel(doneLabel); } catch (e) { debugLog('[WARN] message.addLabel failed', e); }
+    }
+  } catch (e) {
+    debugLog('[WARN] fetch messages failed', e);
+  }
+}
 
 /** メイン：対象メール（メッセージ単位）→Chatworkタスク作成→ログ記録→ラベル付与→サマリー更新 */
 function createTasksWithLogging() {
+  debugLog('[HB] BEGIN createTasksWithLogging', new Date());
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const logSheet = ensureLogSheet_(ss);
   const summarySheet = ensureSummarySheet_(ss);
@@ -60,11 +100,14 @@ function createTasksWithLogging() {
   // 件名は OR 条件で検索
   const subjectOr = (CONFIG.SUBJECT_QUERIES || []).map(q => `"${q}"`).join(' OR ');
   const gmailSearchQuery = `deliveredto:${CONFIG.INFO_ADDRESS} newer_than:${CONFIG.SEARCH_DAYS}d subject:(${subjectOr})`;
+  debugLog('[HB] QUERY', gmailSearchQuery);
   const threads = GmailApp.search(gmailSearchQuery);
+  debugLog('[HB] THREADS(found)', threads.length);
   // 期間しきい値（メッセージ日時）
   const thresholdDate = new Date(Date.now() - CONFIG.SEARCH_DAYS * 24 * 3600 * 1000);
 
   let newLogRows = [];
+  let processedCount = 0, skippedCount = 0;
   threads.forEach(thread => {
     const messages = thread.getMessages();
     messages.forEach(msg => {
@@ -74,7 +117,13 @@ function createTasksWithLogging() {
         if (msgDate && msgDate < thresholdDate) return;
 
         const subject = msg.getSubject() || '';
-        if (!CONFIG.SUBJECT_HOOK.test(subject)) return;
+        const subjectHookOk = CONFIG.SUBJECT_HOOK.test(subject);
+        debugLog('[HB] MSG',
+          Utilities.formatDate(msgDate || new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm'),
+          `subject="${subject}"`,
+          `hook=${subjectHookOk}`
+        );
+        if (!subjectHookOk) return;
 
         const gmailMessageId = String(msg.getId());
         if (processedMsgIds.has(gmailMessageId)) return;
@@ -83,6 +132,28 @@ function createTasksWithLogging() {
         const category = detectCategory_(subject);
         const plainBodyForDetect = (msg.getPlainBody && msg.getPlainBody()) || msg.getBody() || '';
         const isUrgent = (subject.indexOf(CONFIG.URGENT_KEYWORD) !== -1) || (plainBodyForDetect.indexOf(CONFIG.URGENT_KEYWORD) !== -1);
+
+        // === 本文フィルタ：通知スキップ判定 ===
+        const skipHit = bodySkipHit_(category, plainBodyForDetect, subject);
+        if (skipHit) debugLog('[HB] BODY_SKIP_HIT', skipHit);
+        if (skipHit) {
+          // ログ（skipped）＋ 重複防止ラベル（任意）
+          const now = new Date();
+          newLogRows.push([
+            now,                 // A: processed_at
+            threadId,            // B: gmail_thread_id
+            gmailMessageId,      // C: gmail_message_id
+            subject,             // D: subject
+            msg.getFrom() || '', // E: from
+            category,            // F: category
+            '',                  // G: chatwork_message_id
+            '',                  // H: due_unix
+            `skipped:${skipHit}` // I: status
+          ]);
+          if (CONFIG.SKIP_ADD_DONE_LABEL) applyDoneLabel_(thread);
+          skippedCount++;
+          return; // ← 通知せず、このメッセージの処理を完了
+        }
 
         const body = isUrgent ? buildUrgentBody_(msg) : buildTaskBody_(msg);
         const dueUnix = CONFIG.DUE.enable ? computeDueUnix_(CONFIG.DUE) : '';
@@ -113,11 +184,8 @@ function createTasksWithLogging() {
         ]);
 
         // --- ラベル（視認用。GmailAppではスレッドに付与）---
-        try {
-          thread.addLabel(doneLabel);
-        } catch (labelErr) {
-          console.warn('Failed to add label to thread:', labelErr);
-        }
+        applyDoneLabel_(thread);
+        processedCount++;
 
       } catch (err) {
         console.error(err);
@@ -131,6 +199,7 @@ function createTasksWithLogging() {
 
   // 集計を更新
   updateSummary_(logSheet, summarySheet);
+  debugLog('[HB] END createTasksWithLogging', {processedCount, skippedCount, appended: newLogRows.length});
 }
 
 /** Chatwork：メッセージ投稿 → message_id を返す */
@@ -176,6 +245,30 @@ function mapCategoryToRoomId_(categoryName) {
 function detectCategory_(subject) {
   for (const c of CONFIG.CATEGORIES) if (c.pattern.test(subject)) return c.name;
   return CONFIG.DEFAULT_CATEGORY;
+}
+
+/** 本文スキップ判定（ヒットしたパターン文字列 or 空文字） */
+function bodySkipHit_(category, plainBody, subject) {
+  if (!plainBody) return '';
+  // トップページ限定（設定で切替）
+  if (CONFIG.BODY_SKIP_ONLY_FOR_TOP) {
+    const subj = subject || '';
+    const isTop = /トップページ/.test(subj) || category === 'トップページ';
+    if (!isTop) return '';
+  }
+  for (const p of CONFIG.BODY_SKIP_PATTERNS) {
+    let re = p;
+    if (typeof p === 'string') {
+      // 完全一致に近い検索のためエスケープして正規表現化
+      re = new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    }
+    try {
+      if (re.test(plainBody)) return (typeof p === 'string') ? p : re.toString();
+    } catch (_) {
+      // 正規表現エラーは無視
+    }
+  }
+  return '';
 }
 
 /** 通知本文（Chatworkの [info][title]... 形式） */
@@ -272,16 +365,20 @@ function ensureSummarySheet_(ss) {
   return sh;
 }
 
-/** 集計：カテゴリ別の累計/最近30日/最近7日/本日 を更新 */
+/** 集計：カテゴリ別の累計/最近30日/最近7日/本日 を更新（skipped を除外） */
 function updateSummary_(logSheet, summarySheet) {
   const lastRow = logSheet.getLastRow();
   const result = { total:{}, last30:{}, last7:{}, today:{} };
 
   if (lastRow >= 2) {
-    const vals = logSheet.getRange(2,1,lastRow-1,6).getValues(); // A..F: processed_at, thread_id, msg_id, subject, from, category
+    // A..I: processed_at, thread_id, msg_id, subject, from, category, chatwork_message_id, due_unix, status
+    const vals = logSheet.getRange(2,1,lastRow-1,9).getValues();
     const now = new Date();
     const d0 = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     vals.forEach(r => {
+      const status = (r[8] || '').toString();
+      if (status.indexOf('skipped:') === 0) return; // 集計から除外
+
       const dt = new Date(r[0]);
       const cat = r[5] || CONFIG.DEFAULT_CATEGORY;
       // total
@@ -412,4 +509,42 @@ function buildUrgentMessageForTest_() {
   const meta = [`件名: （テスト）至急対応の確認`, `From: test@example.com`, `Gmail: （テスト）リンクなし`, ''].join('\n');
   const body = '（テスト本文）このメッセージは至急ルートの投稿テストです。';
   return `[info][title]${title}[/title]\n${guidance}${meta}${body}\n[/info]\n（送信時刻: ${now}）`;
+}
+
+/** 検証用：ワイド検索で件名をダンプ（検索が0件でも必ず件名をダンプできる） */
+function debugDumpSubjects_() {
+  const q = `in:anywhere newer_than:${CONFIG.SEARCH_DAYS}d`; // deliveredto/subject を外す
+  const threads = GmailApp.search(q);
+  debugLog('[DUMP] query=', q, 'threads=', threads.length);
+  threads.slice(0, 30).forEach((t, i) => {
+    const last = t.getMessages().pop();
+    const ts = last && last.getDate() ? Utilities.formatDate(last.getDate(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm') : 'N/A';
+    debugLog(`[${i}]`, ts, last ? last.getSubject() : '(no subject)');
+  });
+}
+
+/** 過去の skipped 行に後付けでラベルを貼るユーティリティ（1回実行でOK） */
+function replayApplyDoneLabelForSkipped_() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sh = ss.getSheetByName(CONFIG.SHEET_LOG);
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return;
+
+  const rows = sh.getRange(2, 1, lastRow - 1, 9).getValues(); // A..I
+  const doneLabel = GmailApp.getUserLabelByName(CONFIG.DONE_LABEL) || GmailApp.createLabel(CONFIG.DONE_LABEL);
+  let ok = 0, ng = 0;
+
+  for (const r of rows) {
+    const status = String(r[8] || '');
+    if (!status.startsWith('skipped:')) continue;
+    const threadId = String(r[1] || '');
+    if (!threadId) continue;
+    try {
+      const th = GmailApp.getThreadById(threadId);
+      th.addLabel(doneLabel);
+      th.getMessages().forEach(m => { try { m.addLabel(doneLabel); } catch (_) {} });
+      ok++;
+    } catch (e) { ng++; debugLog('[WARN] replay label failed', threadId, e); }
+  }
+  debugLog('[INFO] replayApplyDoneLabelForSkipped_', { ok, ng });
 }
