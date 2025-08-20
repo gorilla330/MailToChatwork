@@ -52,23 +52,40 @@ const CONFIG = {
   SHEET_SUMMARY: 'summary',  // 集計
 
   // ===== 本文フィルタ（通知スキップ） =====
-  // 例：トップページ経由で「■件名：『その他』のお問い合わせ（簡単な内容）」が含まれる営業メールは通知しない
   BODY_SKIP_PATTERNS: [
     '「その他」のお問い合わせ（簡単な内容）'
   ],
-  // true: 件名に「トップページ」を含む（=カテゴリがトップページ）メールに限定して本文フィルタを適用
   BODY_SKIP_ONLY_FOR_TOP: true,
-  // true: スキップしても重複防止ラベルを付けて再処理回避
   SKIP_ADD_DONE_LABEL: true,
-  // デバッグログ出力制御（false で無出力）
   DEBUG: true,
 };
 
 /** 共通ログ関数：Logger.log と console.log の両方に出力 */
 function debugLog(...args) {
-  if (!CONFIG.DEBUG) return; // ← DEBUG=false なら無出力
+  if (!CONFIG.DEBUG) return;
   try { Logger.log(args.map(x => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ')); } catch(_) {}
   try { console.log(...args); } catch(_) {}
+}
+
+/** [ADD] SUBJECT_QUERIES から subject:() 句を生成（RAW: はクォートしない） */
+function buildSubjectClause_() { // [ADD]
+  const parts = (CONFIG.SUBJECT_QUERIES || []).map(q => {
+    if (/^RAW:/.test(q)) return q.replace(/^RAW:/, ''); // 例: RAW:(問合せ フォーム お問い合わせ ありました)
+    return `"${q}"`;
+  });
+  // 日本語の分かち書き・記号差異でも拾えるように保険（広め）
+  parts.push('(お問い合わせ ありました)');
+  parts.push('(問合せ ありました)');
+  return `subject:(${parts.join(' OR ')})`;
+}
+
+/** [ADD] Gmail検索式を構築（堅牢化 + ログ） */
+function buildGmailSearchQuery_() { // [ADD]
+  const addr = CONFIG.INFO_ADDRESS;
+  const addrClause = `(deliveredto:${addr} OR to:${addr})`;
+  const subjectClause = buildSubjectClause_();
+  const q = `in:anywhere ${addrClause} newer_than:${CONFIG.SEARCH_DAYS}d ${subjectClause}`;
+  return q;
 }
 
 /** スレッド＆全メッセージに DONE ラベル付与（保険付き） */
@@ -92,18 +109,26 @@ function createTasksWithLogging() {
   const logSheet = ensureLogSheet_(ss);
   const summarySheet = ensureSummarySheet_(ss);
 
-  // 既処理の messageId セット（スプシ側ガード）
   const processedMsgIds = buildProcessedMsgSet_(logSheet);
 
-  // Gmail検索（期間で絞る。ラベル除外はしない＝同一スレッドの新着も拾う）
-  const doneLabel = GmailApp.getUserLabelByName(CONFIG.DONE_LABEL) || GmailApp.createLabel(CONFIG.DONE_LABEL);
-  // 件名は OR 条件で検索
-  const subjectOr = (CONFIG.SUBJECT_QUERIES || []).map(q => `"${q}"`).join(' OR ');
-  const gmailSearchQuery = `deliveredto:${CONFIG.INFO_ADDRESS} newer_than:${CONFIG.SEARCH_DAYS}d subject:(${subjectOr})`;
+  // ===== Gmail検索（改良版） =====
+  let gmailSearchQuery = buildGmailSearchQuery_(); // [CHG]
   debugLog('[HB] QUERY', gmailSearchQuery);
-  const threads = GmailApp.search(gmailSearchQuery);
+  let threads = GmailApp.search(gmailSearchQuery);
   debugLog('[HB] THREADS(found)', threads.length);
-  // 期間しきい値（メッセージ日時）
+
+  // 0件なら「宛先制限なし」のフォールバックでも探す（ログだけ残す）[ADD]
+  if (!threads.length) {
+    const fallbackQ = `in:anywhere newer_than:${CONFIG.SEARCH_DAYS}d ${buildSubjectClause_()}`;
+    debugLog('[HB] FALLBACK QUERY', fallbackQ);
+    const fb = GmailApp.search(fallbackQ);
+    debugLog('[HB] FALLBACK THREADS(found)', fb.length);
+    if (fb.length) {
+      debugLog('[INFO] 取りこぼし推定: deliveredto/to 条件で弾かれている可能性が高い');
+      threads = fb; // 実際に処理も走らせる（取りこぼし防止）
+    }
+  }
+
   const thresholdDate = new Date(Date.now() - CONFIG.SEARCH_DAYS * 24 * 3600 * 1000);
 
   let newLogRows = [];
@@ -112,7 +137,6 @@ function createTasksWithLogging() {
     const messages = thread.getMessages();
     messages.forEach(msg => {
       try {
-        // 期間外のメッセージはスキップ
         const msgDate = msg.getDate && msg.getDate();
         if (msgDate && msgDate < thresholdDate) return;
 
@@ -137,64 +161,83 @@ function createTasksWithLogging() {
         const skipHit = bodySkipHit_(category, plainBodyForDetect, subject);
         if (skipHit) debugLog('[HB] BODY_SKIP_HIT', skipHit);
         if (skipHit) {
-          // ログ（skipped）＋ 重複防止ラベル（任意）
           const now = new Date();
           newLogRows.push([
-            now,                 // A: processed_at
-            threadId,            // B: gmail_thread_id
-            gmailMessageId,      // C: gmail_message_id
-            subject,             // D: subject
-            msg.getFrom() || '', // E: from
-            category,            // F: category
-            '',                  // G: chatwork_message_id
-            '',                  // H: due_unix
-            `skipped:${skipHit}` // I: status
+            now,                 // processed_at
+            threadId,            // gmail_thread_id
+            gmailMessageId,      // gmail_message_id
+            subject,             // subject
+            msg.getFrom() || '', // from
+            category,            // category
+            '',                  // chatwork_message_id
+            '',                  // due_unix
+            `skipped:${skipHit}` // status
           ]);
           if (CONFIG.SKIP_ADD_DONE_LABEL) applyDoneLabel_(thread);
           skippedCount++;
-          return; // ← 通知せず、このメッセージの処理を完了
+          return;
         }
 
         const body = isUrgent ? buildUrgentBody_(msg) : buildTaskBody_(msg);
         const dueUnix = CONFIG.DUE.enable ? computeDueUnix_(CONFIG.DUE) : '';
 
-        // --- Chatwork 通知（メッセージ投稿）---
-        // 1) すべてマイチャットへ
+        // --- Chatwork 通知（堅牢化）---
+        // 1) マイチャットへ（確認用・必ず試行）
+        let chatworkMessageId = '';
+        let status = 'created';
+        let cwError = '';
+
         const myChatMessageId = cwPostMessage_(CONFIG.TEST_ROOM_ID, body);
-        // 2) 本番モードのときはカテゴリ対応ルームへも通知
-        let chatworkMessageId = myChatMessageId;
+        chatworkMessageId = myChatMessageId;
+
+        // 2) 本番モード: カテゴリ対応ルームへ
         if (CONFIG.MODE === 'prod') {
           const destRoomId = isUrgent ? CONFIG.PROD_ROOM_ID : mapCategoryToRoomId_(category);
-          const postedId = cwPostMessage_(destRoomId, body);
-          if (postedId) chatworkMessageId = postedId;
+          try { // [ADD] 個別 try/catch
+            const postedId = cwPostMessage_(destRoomId, body);
+            if (postedId) chatworkMessageId = postedId;
+          } catch (e) {
+            cwError = String(e);
+            status = `created_with_error:${String(e).slice(0,200)}`;
+            debugLog('[ERR] Chatwork post failed for dest room', destRoomId, e);
+
+            // 任意: 一般案件にフォールバック投稿（必要なければコメントアウト）
+            try {
+              const fbBody = `[info][title]【自動振替】カテゴリ「${category}」宛の投稿に失敗しました（確認をお願いします）[/title]\n${body}`;
+              const fbId = cwPostMessage_(CONFIG.ROOM_MAP.general, fbBody);
+              if (fbId) chatworkMessageId = fbId;
+              debugLog('[INFO] Fallback posted to general', CONFIG.ROOM_MAP.general);
+            } catch (_) { /* フォールバック失敗は握りつぶし */ }
+          }
         }
 
-        // --- ログ行を追加 ---
+        // --- ログ行を追加（失敗でも必ず記録） ---
         const now = new Date();
         newLogRows.push([
-          now,                 // A: processed_at
-          threadId,            // B: gmail_thread_id
-          gmailMessageId,      // C: gmail_message_id（重複判定のキー）
-          subject,             // D: subject
-          msg.getFrom() || '', // E: from
-          category,            // F: category
-          chatworkMessageId || '', // G: chatwork_message_id
-          dueUnix || '',       // H: due_unix
-          'created'            // I: status
+          now,                 // processed_at
+          threadId,            // gmail_thread_id
+          gmailMessageId,      // gmail_message_id（重複判定のキー）
+          subject,             // subject
+          msg.getFrom() || '', // from
+          category,            // category
+          chatworkMessageId || '', // chatwork_message_id
+          dueUnix || '',       // due_unix
+          status               // status
         ]);
 
-        // --- ラベル（視認用。GmailAppではスレッドに付与）---
+        // --- ラベル（失敗でも付ける：次回の迷子防止） [CHG] ---
         applyDoneLabel_(thread);
         processedCount++;
 
       } catch (err) {
+        // ここに落ちるのは想定外の例外（ラベリング前）。メールで通知。
         console.error(err);
         GmailApp.sendEmail(Session.getActiveUser().getEmail(), '【GAS】Chatworkタスク作成エラー', String(err));
       }
     });
   });
 
-  // まとめてログ追加（1回のappendで高速化）
+  // まとめてログ追加
   if (newLogRows.length) logSheet.getRange(logSheet.getLastRow()+1, 1, newLogRows.length, newLogRows[0].length).setValues(newLogRows);
 
   // 集計を更新
@@ -217,7 +260,6 @@ function cwPostMessage_(roomId, body) {
   const code = res.getResponseCode();
   if (code < 200 || code >= 300) throw new Error(`Chatworkメッセージ投稿エラー ${code}: ${res.getContentText()}`);
 
-  // 期待レス例: {"message_id":"1234567890"}
   try {
     const json = JSON.parse(res.getContentText());
     const id = json.message_id ? String(json.message_id) : '';
@@ -227,17 +269,13 @@ function cwPostMessage_(roomId, body) {
   }
 }
 
-/** 現在のモードに応じて投稿先ルームIDを返す */
-function getActiveRoomId_() {
-  return CONFIG.MODE === 'prod' ? CONFIG.PROD_ROOM_ID : CONFIG.TEST_ROOM_ID;
-}
+function getActiveRoomId_() { return CONFIG.MODE === 'prod' ? CONFIG.PROD_ROOM_ID : CONFIG.TEST_ROOM_ID; }
 
 /** カテゴリ名→本番の投稿先ルームID */
 function mapCategoryToRoomId_(categoryName) {
   if (categoryName === '労働') return CONFIG.ROOM_MAP.labor;
   if (categoryName === 'アスベスト') return CONFIG.ROOM_MAP.asbestos;
   if (categoryName === 'B型肝炎') return CONFIG.ROOM_MAP.bkan;
-  // トップページやその他は一般案件へ
   return CONFIG.ROOM_MAP.general;
 }
 
@@ -250,23 +288,20 @@ function detectCategory_(subject) {
 /** 本文スキップ判定（ヒットしたパターン文字列 or 空文字） */
 function bodySkipHit_(category, plainBody, subject) {
   if (!plainBody) return '';
-  // トップページ限定（設定で切替）
   if (CONFIG.BODY_SKIP_ONLY_FOR_TOP) {
     const subj = subject || '';
     const isTop = /トップページ/.test(subj) || category === 'トップページ';
     if (!isTop) return '';
+    // トップページ案件のみフィルタ: OK
   }
   for (const p of CONFIG.BODY_SKIP_PATTERNS) {
     let re = p;
     if (typeof p === 'string') {
-      // 完全一致に近い検索のためエスケープして正規表現化
       re = new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
     }
     try {
       if (re.test(plainBody)) return (typeof p === 'string') ? p : re.toString();
-    } catch (_) {
-      // 正規表現エラーは無視
-    }
+    } catch (_) {}
   }
   return '';
 }
@@ -288,14 +323,12 @@ function buildTaskBody_(msg) {
   const plain = (msg.getPlainBody && msg.getPlainBody()) || msg.getBody() || '';
   const meta = [`件名: ${msg.getSubject()}`, `From: ${msg.getFrom()}`, `Gmail: ${link}`, ''].join('\n');
 
-  // 本文の取り込み（長文はプレーン部分のみを切り詰める）
   let bodyPart = CONFIG.INCLUDE_FULL_BODY ? plain : plain.slice(0, 600);
   const fixedPart = `[info][title]${title}[/title]\n${guidance}${meta}`;
   const maxAllowedForBody = Math.max(0, CONFIG.MAX_BODY_LEN - fixedPart.length - 20);
   if (bodyPart.length > maxAllowedForBody) {
     bodyPart = bodyPart.slice(0, maxAllowedForBody) + '\n…(長文のため省略)';
   }
-
   return `${fixedPart}${bodyPart}[/info]`;
 }
 
@@ -321,7 +354,6 @@ function buildUrgentBody_(msg) {
   if (bodyPart.length > maxAllowedForBody) {
     bodyPart = bodyPart.slice(0, maxAllowedForBody) + '\n…(長文のため省略)';
   }
-
   return `${fixedPart}${bodyPart}[/info]`;
 }
 
@@ -332,7 +364,6 @@ function computeDueUnix_(opt) {
   const dt = new Date(now.getTime());
   dt.setDate(dt.getDate() + (opt.daysFromNow || 0));
   dt.setHours(opt.hour ?? 18, opt.minute ?? 0, 0, 0);
-  // 厳密なTZ変換が必要なら Utilities.formatDate を使ってもOK
   return Math.floor(dt.getTime() / 1000);
 }
 
@@ -371,28 +402,22 @@ function updateSummary_(logSheet, summarySheet) {
   const result = { total:{}, last30:{}, last7:{}, today:{} };
 
   if (lastRow >= 2) {
-    // A..I: processed_at, thread_id, msg_id, subject, from, category, chatwork_message_id, due_unix, status
     const vals = logSheet.getRange(2,1,lastRow-1,9).getValues();
     const now = new Date();
     const d0 = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     vals.forEach(r => {
       const status = (r[8] || '').toString();
-      if (status.indexOf('skipped:') === 0) return; // 集計から除外
+      if (status.indexOf('skipped:') === 0) return;
 
       const dt = new Date(r[0]);
       const cat = r[5] || CONFIG.DEFAULT_CATEGORY;
-      // total
       result.total[cat] = (result.total[cat]||0)+1;
-      // last30
       if ((now - dt) <= 30*24*3600*1000) result.last30[cat] = (result.last30[cat]||0)+1;
-      // last7
       if ((now - dt) <= 7*24*3600*1000) result.last7[cat] = (result.last7[cat]||0)+1;
-      // today
       if (dt >= d0) result.today[cat] = (result.today[cat]||0)+1;
     });
   }
 
-  // シートをクリアして書き直し
   summarySheet.clear();
   const sections = [
     ['カテゴリ別 合計', result.total],
@@ -431,7 +456,6 @@ function testPostToProd() {
   const body = buildInfoMessageForTest_();
   const posted = [];
 
-  // マイチャット（確認用）
   try {
     const mid = cwPostMessage_(CONFIG.TEST_ROOM_ID, body);
     posted.push({ room: 'mychat', roomId: CONFIG.TEST_ROOM_ID, message_id: mid });
@@ -439,7 +463,6 @@ function testPostToProd() {
     posted.push({ room: 'mychat', roomId: CONFIG.TEST_ROOM_ID, error: String(e) });
   }
 
-  // 本番の各カテゴリルーム
   const targets = [
     { key: 'general',   roomId: CONFIG.ROOM_MAP.general },
     { key: 'labor',     roomId: CONFIG.ROOM_MAP.labor },
@@ -475,7 +498,6 @@ function testPostUrgent() {
   const body = buildUrgentMessageForTest_();
   const posted = [];
 
-  // マイチャット
   try {
     const mid = cwPostMessage_(CONFIG.TEST_ROOM_ID, body);
     posted.push({ room: 'mychat', roomId: CONFIG.TEST_ROOM_ID, message_id: mid });
@@ -483,7 +505,6 @@ function testPostUrgent() {
     posted.push({ room: 'mychat', roomId: CONFIG.TEST_ROOM_ID, error: String(e) });
   }
 
-  // 全体スレ（至急の宛先）
   try {
     const mid = cwPostMessage_(CONFIG.PROD_ROOM_ID, body);
     posted.push({ room: 'prod_all', roomId: CONFIG.PROD_ROOM_ID, message_id: mid });
@@ -523,8 +544,19 @@ function debugDumpSubjects_() {
   });
 }
 
+/** [ADD] 任意のクエリで対象を確認するデバッグ */
+function debugSearchQuery_(q) { // [ADD]
+  const threads = GmailApp.search(q);
+  debugLog('[DEBUG SEARCH] q=', q, 'threads=', threads.length);
+  threads.slice(0, 20).forEach((t, i) => {
+    const last = t.getMessages().pop();
+    const ts = last && last.getDate() ? Utilities.formatDate(last.getDate(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm') : 'N/A';
+    debugLog(`[${i}]`, ts, last ? last.getSubject() : '(no subject)', 'threadId=' + t.getId());
+  });
+}
+
 /** 過去の skipped 行に後付けでラベルを貼るユーティリティ（1回実行でOK） */
-function replayApplyDoneLabelForSkipped_() {
+function replayApplyDoneLabelForSkipped() {
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const sh = ss.getSheetByName(CONFIG.SHEET_LOG);
   const lastRow = sh.getLastRow();
@@ -547,4 +579,18 @@ function replayApplyDoneLabelForSkipped_() {
     } catch (e) { ng++; debugLog('[WARN] replay label failed', threadId, e); }
   }
   debugLog('[INFO] replayApplyDoneLabelForSkipped_', { ok, ng });
+}
+
+
+function debugSearch_current(){            // 現行の検索式（改修版が有効か判定）
+  debugSearchQuery_(buildGmailSearchQuery_());
+}
+function debugSearch_subjectOnly7d(){      // 宛先条件なしフォールバック（7日）
+  const q = 'in:anywhere newer_than:7d ' + buildSubjectClause_();
+  debugSearchQuery_(q);
+}
+function debugSearch_fromProp(){           // プロパティに書いた任意クエリを実行
+  const q = PropertiesService.getScriptProperties().getProperty('DEBUG_Q');
+  if (!q) throw new Error('Script property DEBUG_Q が未設定です');
+  debugSearchQuery_(q);
 }
